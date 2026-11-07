@@ -1,0 +1,266 @@
+import SimplePeer from 'simple-peer';
+import { getTURNServers } from './turn-config';
+import { getCurrentWorker, getNextWorker, resetWorkerPool } from './cloudflare-workers-pool';
+
+let ws: WebSocket | null = null;
+let myId: string | null = null;
+let peer: SimplePeer.Instance | null = null;
+let remotePeerId: string | null = null;
+let storedOnMessage: ((peerId: string, data: string) => void) | null = null;
+let storedOnConnect: ((remotePeerId?: string) => void) | null = null;
+let storedOnDisconnect: ((reason?: string) => void) | undefined = undefined;
+let pendingSignals: Array<{ type: string; src: string | null; dst: string; signal: any }> = [];
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function tryConnectWorker(
+  workerUrl: string,
+  onMessage: (peerId: string, data: string) => void,
+  onConnect: (remotePeerId?: string) => void,
+  onDisconnect?: (reason?: string) => void
+): Promise<string | null> {
+  storedOnMessage = onMessage;
+  storedOnConnect = onConnect;
+  storedOnDisconnect = onDisconnect;
+  
+  if (peer) {
+    peer.destroy();
+    peer = null;
+  }
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+
+  return new Promise((resolve, reject) => {
+    myId = Math.random().toString(36).substr(2, 9);
+    
+    console.log('[SIMPLEPEER] Trying worker:', workerUrl);
+    ws = new WebSocket(`${workerUrl}?key=peerjs&id=${myId}&token=token`);
+    
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('Worker timeout'));
+      }
+    }, 5000);
+
+    ws.onopen = () => {
+      console.log('[SIMPLEPEER] WebSocket connected, ID:', myId);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        resolve(myId);
+      }
+    };
+    
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      
+      if (msg.type === 'OPEN') {
+        console.log('[SIMPLEPEER] Server acknowledged');
+        return;
+      }
+      
+      if (msg.type === 'SIGNAL' && msg.signal) {
+        if (!peer) {
+          console.log('[SIMPLEPEER] Incoming connection from:', msg.src);
+          remotePeerId = msg.src;
+          peer = new SimplePeer({
+            initiator: false,
+            config: { 
+              iceServers: getTURNServers(),
+              iceTransportPolicy: 'all'
+            }
+          });
+          
+          setupPeer(peer, storedOnMessage!, storedOnConnect!, storedOnDisconnect, msg.src);
+        }
+        
+        peer.signal(msg.signal);
+      }
+    };
+    
+    ws.onerror = (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        reject(err);
+      }
+    };
+    
+    ws.onclose = () => {
+      console.log('[SIMPLEPEER] WebSocket closed');
+      if (peer && peer.connected) {
+        console.log('[SIMPLEPEER] WebRTC still connected, WS close is benign');
+        return;
+      }
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        reject(new Error('WebSocket closed before connect'));
+      } else if (!peer) {
+        if (storedOnDisconnect) storedOnDisconnect('peer-left');
+      }
+    };
+  });
+}
+
+export async function initSimplePeer(
+  onMessage: (peerId: string, data: string) => void,
+  onConnect: (remotePeerId?: string) => void,
+  onDisconnect?: (reason?: string) => void
+): Promise<string | null> {
+  resetWorkerPool();
+  
+  let currentWorker = getCurrentWorker();
+  
+  while (currentWorker) {
+    try {
+      const id = await tryConnectWorker(currentWorker, onMessage, onConnect, onDisconnect);
+      console.log('[SIMPLEPEER] Connected to worker:', currentWorker);
+      return id;
+    } catch (err) {
+      console.warn('[SIMPLEPEER] Worker failed:', currentWorker, err);
+      const nextWorker = getNextWorker();
+      if (!nextWorker) {
+        throw new Error('All Cloudflare Workers failed');
+      }
+      currentWorker = nextWorker;
+    }
+  }
+  
+  throw new Error('No workers available');
+}
+
+function setupPeer(
+  p: SimplePeer.Instance,
+  onMessage: (peerId: string, data: string) => void,
+  onConnect: (remotePeerId?: string) => void,
+  onDisconnect?: (reason?: string) => void,
+  targetPeerId?: string
+) {
+  let disconnectCalled = false;
+  const callDisconnect = (reason: string) => {
+    if (!disconnectCalled && onDisconnect) {
+      disconnectCalled = true;
+      onDisconnect(reason);
+    }
+  };
+  p.on('signal', (signal) => {
+    const dst = targetPeerId || remotePeerId || 'unknown';
+    const msg = { type: 'SIGNAL', src: myId, dst, signal };
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('[SIMPLEPEER] Sending signal to:', dst);
+      ws.send(JSON.stringify(msg));
+    } else {
+      console.log('[SIMPLEPEER] WS not open, queuing signal for:', dst);
+      pendingSignals.push(msg);
+    }
+  });
+  
+  let iceRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  p.on('connect', () => {
+    console.log('[SIMPLEPEER] P2P connected');
+    onConnect(targetPeerId || remotePeerId || undefined);
+    
+    const pc = (p as any)._pc;
+    if (pc) {
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        console.log('[SIMPLEPEER] ICE state:', state);
+
+        if (state === 'connected' || state === 'completed') {
+          if (iceRecoveryTimer) {
+            clearTimeout(iceRecoveryTimer);
+            iceRecoveryTimer = null;
+            console.log('[SIMPLEPEER] ICE recovered');
+          }
+        } else if (state === 'disconnected') {
+          if (!iceRecoveryTimer) {
+            iceRecoveryTimer = setTimeout(() => {
+              if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                console.log('[SIMPLEPEER] ICE did not recover, closing');
+                callDisconnect('peer-left');
+              }
+              iceRecoveryTimer = null;
+            }, 5000);
+          }
+        } else if (state === 'failed') {
+          if (iceRecoveryTimer) {
+            clearTimeout(iceRecoveryTimer);
+            iceRecoveryTimer = null;
+          }
+          callDisconnect('peer-left');
+        }
+      };
+    }
+  });
+  
+  p.on('data', (data) => {
+    onMessage('remote', data.toString());
+  });
+  
+  p.on('close', () => {
+    console.log('[SIMPLEPEER] P2P closed gracefully');
+    callDisconnect('peer-left');
+  });
+  
+  p.on('error', (err) => {
+    console.error('[SIMPLEPEER] P2P error:', err);
+    const errMsg = err?.message || err?.toString() || '';
+    if (errMsg.includes('Ice connection failed')) {
+      callDisconnect('peer-left');
+    } else {
+      callDisconnect('network-error');
+    }
+  });
+}
+
+export function connectSimplePeer(
+  targetPeerId: string,
+  onMessage: (peerId: string, data: string) => void,
+  onConnect: (remotePeerId?: string) => void,
+  onDisconnect?: (reason?: string) => void
+) {
+  console.log('[SIMPLEPEER] Connecting to:', targetPeerId);
+  remotePeerId = targetPeerId;
+  
+  peer = new SimplePeer({
+    initiator: true,
+    config: { 
+      iceServers: getTURNServers(),
+      iceTransportPolicy: 'all'
+    }
+  });
+  
+  setupPeer(peer, onMessage, onConnect, onDisconnect, targetPeerId);
+}
+
+export function sendSimplePeer(data: string) {
+  if (peer) {
+    peer.send(data);
+  }
+}
+
+export function destroySimplePeer() {
+  peer?.destroy();
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+  }
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  peer = null;
+  ws = null;
+  myId = null;
+  remotePeerId = null;
+  storedOnMessage = null;
+  storedOnConnect = null;
+  storedOnDisconnect = undefined;
+  pendingSignals = [];
+}

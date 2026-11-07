@@ -1,0 +1,39 @@
+{
+  "name": "ghostchat",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "rm -rf .next && next dev",
+    "build": "next build",
+    "start": "next start",
+    "export": "next export",
+    "deploy": "./deploy.sh",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:worker": "node tests/cloudflare-worker/test-worker-websocket.js && node tests/cloudflare-worker/test-worker-multi-peer.js && node tests/cloudflare-worker/test-worker-stress.js && node tests/cloudflare-worker/test-worker-disconnect.js && node tests/cloudflare-worker/test-worker-invalid.js && node tests/cloudflare-worker/test-worker-id-endpoint.js"
+  },
+  "dependencies": {
+    "framer-motion": "^12.23.26",
+    "next": "^15.0.0",
+    "peerjs": "^1.5.5",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "simple-peer": "^9.11.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/simple-peer": "^9.11.9",
+    "@vitejs/plugin-react": "^5.1.1",
+    "@vitest/ui": "^4.0.16",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.16"
+  }
+}
